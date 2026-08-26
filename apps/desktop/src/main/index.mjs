@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { release as operatingSystemRelease } from "node:os";
 import { SidecarRpcClient } from "./rpc.mjs";
 import { resourceRequestHeaders } from "./resource-request.mjs";
-import { isSafeResourceId, resourceIdFromRequest } from "./resource-url.mjs";
+import { cachedResourceResponse, isSafeResourceId, resourceIdFromRequest } from "./resource-url.mjs";
 import { isSupportedAssociatedFile } from "./file-association.mjs";
 import { accountDataDirectory, accountScopeKey } from "./account-scope.mjs";
 import { rotateDiagnosticLog } from "./diagnostic-log.mjs";
@@ -80,6 +80,8 @@ let updateCheckInFlight = null;
 let updateDownloadInFlight = null;
 let updateCheckTimer = null;
 let lastUpdateCheckAt = 0;
+let downloadedUpdateVersion = null;
+let promptedUpdateVersion = null;
 let sidecarScopeKey = "anonymous";
 let activeAccountId = null;
 let shutdownCleanupStarted = false;
@@ -452,7 +454,7 @@ const registerResourceProtocol = () => {
       const bytes = await readFile(bytesPath);
       let metadata = {};
       try { metadata = JSON.parse(await readFile(metadataPath, "utf8")); } catch {}
-      return new Response(bytes, { headers: { "Content-Type": metadata.contentType || "application/octet-stream", "Cache-Control": "no-store" } });
+      return cachedResourceResponse(bytes, metadata.contentType, request.headers.get("range"));
     } catch {
       // Fall through to the instance while online, then persist the response.
     }
@@ -462,16 +464,30 @@ const registerResourceProtocol = () => {
     try {
       const cookies = await session.defaultSession.cookies.get({ url: sourceUrl });
       const headers = resourceRequestHeaders({ cookies, sessionToken: desktopSessionToken });
+      const rangeHeader = request.headers.get("range");
+      if (rangeHeader) headers.set("range", rangeHeader);
       const response = await net.fetch(sourceUrl, { headers });
       if (!response.ok) return new Response("Resource request failed", { status: response.status });
       const body = Buffer.from(await response.arrayBuffer());
+      if (response.status === 206) {
+        const responseHeaders = new Headers({
+          "Accept-Ranges": response.headers.get("accept-ranges") || "bytes",
+          "Cache-Control": "no-store",
+          "Content-Type": response.headers.get("content-type") || "application/octet-stream",
+        });
+        for (const name of ["content-length", "content-range", "etag", "last-modified"]) {
+          const value = response.headers.get(name);
+          if (value) responseHeaders.set(name, value);
+        }
+        return new Response(body, { status: 206, headers: responseHeaders });
+      }
       await mkdir(directory, { recursive: true });
       await restrictDirectory(directory);
       await writeFile(bytesPath, body, { mode: 0o600 });
       await writeFile(metadataPath, JSON.stringify({ contentType: response.headers.get("content-type") || "application/octet-stream" }), { mode: 0o600 });
       await restrictFile(bytesPath);
       await restrictFile(metadataPath);
-      return new Response(body, { headers: { "Content-Type": response.headers.get("content-type") || "application/octet-stream", "Cache-Control": "no-store" } });
+      return cachedResourceResponse(body, response.headers.get("content-type"), null);
     } catch (error) {
       void writeDiagnostic("resource.cache-failed", { resourceId, message: error.message });
       return new Response("Resource unavailable", { status: 504 });
@@ -505,6 +521,16 @@ const refreshTrayMenu = () => {
   createTray();
 };
 
+const desktopUpdateStatus = () => ({
+  state: updateState,
+  version: downloadedUpdateVersion,
+});
+
+const publishDesktopUpdateStatus = () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("desktop:update-status-changed", desktopUpdateStatus());
+};
+
 const installDownloadedUpdate = () => {
   if (updateState !== "downloaded") return { started: false };
   // The normal window close handler hides the app. Mark this as a real quit
@@ -512,6 +538,34 @@ const installDownloadedUpdate = () => {
   isQuitting = true;
   autoUpdater.quitAndInstall(false, true);
   return { started: true };
+};
+
+const promptForDownloadedUpdate = async (version) => {
+  const promptKey = version || "unknown";
+  if (isQuitting || promptedUpdateVersion === promptKey) return;
+  promptedUpdateVersion = promptKey;
+  showWindow(mainWindow);
+  const isChinese = app.getLocale().toLowerCase().startsWith("zh");
+  const result = await dialog.showMessageBox(mainWindow, {
+    type: "info",
+    title: isChinese ? "EdgeEver 更新已就绪" : "EdgeEver update ready",
+    message: isChinese
+      ? `EdgeEver v${version || "最新版"} 已下载完成。`
+      : `EdgeEver v${version || "latest"} has been downloaded.`,
+    detail: isChinese
+      ? "现在重启即可完成安装。也可以选择稍后，EdgeEver 会在您退出应用时自动安装。"
+      : "Restart now to finish installing it. You can also choose Later; EdgeEver will install it automatically when you quit the app.",
+    buttons: [isChinese ? "重启以更新" : "Restart to Update", isChinese ? "稍后" : "Later"],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (result.response === 0) {
+    void writeDiagnostic("update.install-confirmed", { version });
+    installDownloadedUpdate();
+  } else {
+    void writeDiagnostic("update.install-deferred", { version });
+  }
 };
 
 const checkForDesktopUpdate = (reason, { force = false, throwOnError = false } = {}) => {
@@ -552,14 +606,40 @@ const configureAutoUpdater = () => {
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = true;
   autoUpdater.autoRunAppAfterInstall = true;
-  autoUpdater.on("update-available", () => { updateState = "available"; refreshTrayMenu(); void writeDiagnostic("update.available"); });
-  autoUpdater.on("update-not-available", () => { updateState = "idle"; refreshTrayMenu(); void writeDiagnostic("update.not-available"); });
+  autoUpdater.on("update-available", (info) => {
+    updateState = "available";
+    downloadedUpdateVersion = info?.version || null;
+    refreshTrayMenu();
+    publishDesktopUpdateStatus();
+    void writeDiagnostic("update.available", { version: info?.version });
+  });
+  autoUpdater.on("update-not-available", () => {
+    updateState = "idle";
+    downloadedUpdateVersion = null;
+    refreshTrayMenu();
+    publishDesktopUpdateStatus();
+    void writeDiagnostic("update.not-available");
+  });
   autoUpdater.on("download-progress", (progress) => { void writeDiagnostic("update.download-progress", { percent: progress.percent }); });
-  autoUpdater.on("update-downloaded", () => { updateState = "downloaded"; refreshTrayMenu(); void writeDiagnostic("update.downloaded"); });
+  autoUpdater.on("update-downloaded", (info) => {
+    updateState = "downloaded";
+    downloadedUpdateVersion = info?.version || downloadedUpdateVersion;
+    refreshTrayMenu();
+    publishDesktopUpdateStatus();
+    void writeDiagnostic("update.downloaded", { version: downloadedUpdateVersion });
+    void promptForDownloadedUpdate(downloadedUpdateVersion).catch((error) => {
+      promptedUpdateVersion = null;
+      void writeDiagnostic("update.prompt-failed", { message: error.message });
+    });
+  });
   autoUpdater.on("error", (error) => {
     isQuitting = false;
-    if (updateState !== "downloaded") updateState = "idle";
+    if (updateState !== "downloaded") {
+      updateState = "idle";
+      downloadedUpdateVersion = null;
+    }
     refreshTrayMenu();
+    publishDesktopUpdateStatus();
     void writeDiagnostic("update.error", { message: error.message });
   });
   void checkForDesktopUpdate("startup", { force: true });
@@ -955,10 +1035,10 @@ app.whenReady().then(async () => {
     }
     return configuredApiBaseUrl;
   });
-  ipcMain.handle("desktop:update-status", () => ({ state: updateState }));
+  ipcMain.handle("desktop:update-status", () => desktopUpdateStatus());
   ipcMain.handle("desktop:check-update", async () => {
     await checkForDesktopUpdate("manual", { force: true, throwOnError: true });
-    return { state: updateState };
+    return desktopUpdateStatus();
   });
   ipcMain.handle("desktop:download-update", () => autoUpdater.downloadUpdate());
   ipcMain.handle("desktop:install-update", () => installDownloadedUpdate());

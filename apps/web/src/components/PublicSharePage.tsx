@@ -22,6 +22,7 @@ import {
   type PublicMemoShare,
 } from "@edgeever/shared";
 import { createEdgeEverMathematics } from "@edgeever/shared/mathematics";
+import { PdfAttachment } from "@/components/editor/PdfAttachment";
 
 const SharedImage = Image.extend({
   addAttributes() {
@@ -75,7 +76,11 @@ const SharedThemeBlock = Node.create({
 
 const SharedDocument = ({ share, token }: { share: PublicMemoShare; token: string }) => {
   const content = useMemo(
-    () => rewriteMemoResourcesForShare(resolveMemoContentDoc(share.contentJson, share.contentMarkdown), token),
+    () => rewriteMemoResourcesForShare(
+      resolveMemoContentDoc(share.contentJson, share.contentMarkdown),
+      token,
+      share.memoShareTokens,
+    ),
     [share, token],
   );
   const editor = useEditor({
@@ -85,6 +90,7 @@ const SharedDocument = ({ share, token }: { share: PublicMemoShare; token: strin
       TaskItem.configure({ nested: true }),
       EdgeEverCodeBlock.configure({ lowlight: codeBlockLowlight, defaultLanguage: "plaintext" }),
       MergeDivider,
+      PdfAttachment,
       ...createEdgeEverMathematics(),
       SharedThemeBlock,
       SharedImage.configure({ allowBase64: false, inline: false }),

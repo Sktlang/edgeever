@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
+import { PdfAttachment } from "@/components/editor/PdfAttachment";
 import Image from "@tiptap/extension-image";
 import { TaskItem, TaskList } from "@tiptap/extension-list";
 import { mergeAttributes } from "@tiptap/core";
@@ -43,6 +44,7 @@ import {
 } from "@/lib/mobile-editor-standalone";
 import { getMemoUpdateQueueId, isMemoUpdateAlreadyApplied, queueMemoUpdate, shouldQueueMemoSaveError } from "@/lib/sync-queue";
 import { createMarkdownImagePasteRule } from "@/lib/markdown-image-paste";
+import { preserveEmptyListIndentOnBackspace, wrapIndentedParagraphInList } from "@/lib/editor-shortcuts";
 import { ThemeBlock } from "./ThemeBlock";
 import { EditorTagPicker } from "./EditorTagPicker";
 import { listLocalTags } from "@/lib/local-mirror";
@@ -194,6 +196,7 @@ export const MobileStandaloneTiptapEditor = ({
   const editor = useEditor({
     extensions: [
       StarterKit,
+      PdfAttachment,
       TaskList,
       TaskItem.configure({ nested: true }),
       MergeDivider,
@@ -213,6 +216,13 @@ export const MobileStandaloneTiptapEditor = ({
     content: emptyDoc(),
     editorProps: {
       attributes: getMobileEditorInputAttributes("edgeever-mobile-tiptap-content"),
+      handleKeyDown: (view, event) => {
+        if (event.key !== "Backspace" || !preserveEmptyListIndentOnBackspace(view.state, view.dispatch)) {
+          return false;
+        }
+        event.preventDefault();
+        return true;
+      },
     },
     onUpdate: ({ editor: activeEditor }) => {
       contentJsonRef.current = activeEditor.getJSON() as TiptapDoc;
@@ -895,6 +905,7 @@ export const MobileStandaloneTiptapEditor = ({
   const currentNotebookLabel =
     notebookOptions.find((notebook) => notebook.id === memo?.notebookId)?.name ?? t("editor.notebookFallback");
   const activeListItemType = editor?.isActive("taskItem") ? "taskItem" : "listItem";
+  const canWrapIndentedParagraph = Boolean(editor && wrapIndentedParagraphInList(editor.state, undefined));
 
   const fallbackMarkdown = memo ? docToMarkdown(contentJsonRef.current) : "";
   const runEditorCommand = (command: () => boolean) => {
@@ -942,15 +953,21 @@ export const MobileStandaloneTiptapEditor = ({
           boldActive={Boolean(editor?.isActive("bold"))}
           bulletListActive={Boolean(editor?.isActive("bulletList"))}
           taskListActive={Boolean(editor?.isActive("taskList"))}
-          increaseListIndentAvailable={Boolean(editor?.can().chain().focus().sinkListItem(activeListItemType).run())}
+          increaseListIndentAvailable={canWrapIndentedParagraph || Boolean(editor?.can().chain().focus().sinkListItem(activeListItemType).run())}
           decreaseListIndentAvailable={Boolean(editor?.can().chain().focus().liftListItem(activeListItemType).run())}
           blockquoteActive={Boolean(editor?.isActive("blockquote"))}
           locale={locale}
           onPickImage={() => imageInputRef.current?.click()}
           onToggleBold={() => runEditorCommand(() => editor?.chain().focus().toggleBold().run() ?? false)}
-          onToggleBulletList={() => runEditorCommand(() => editor?.chain().focus().toggleBulletList().run() ?? false)}
-          onToggleTaskList={() => runEditorCommand(() => editor?.chain().focus().toggleTaskList().run() ?? false)}
-          onIncreaseListIndent={() => runEditorCommand(() => editor?.chain().focus().sinkListItem(activeListItemType).run() ?? false)}
+          onToggleBulletList={() => runEditorCommand(() => (
+            editor ? wrapIndentedParagraphInList(editor.state, editor.view.dispatch, "bulletList") || editor.commands.toggleBulletList() : false
+          ))}
+          onToggleTaskList={() => runEditorCommand(() => (
+            editor ? wrapIndentedParagraphInList(editor.state, editor.view.dispatch, "taskList") || editor.commands.toggleTaskList() : false
+          ))}
+          onIncreaseListIndent={() => runEditorCommand(() => (
+            editor ? wrapIndentedParagraphInList(editor.state, editor.view.dispatch) || editor.commands.sinkListItem(activeListItemType) : false
+          ))}
           onDecreaseListIndent={() => runEditorCommand(() => editor?.chain().focus().liftListItem(activeListItemType).run() ?? false)}
           onToggleBlockquote={() => runEditorCommand(() => editor?.chain().focus().toggleBlockquote().run() ?? false)}
           onSetHorizontalRule={() => runEditorCommand(() => editor?.chain().focus().setHorizontalRule().run() ?? false)}
